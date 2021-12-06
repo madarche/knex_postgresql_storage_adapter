@@ -6,7 +6,11 @@ const toSnakeCase = require('to-snake-case');
 const logger = require('./logger');
 const knex = require('./db').knex;
 
-// All types except "Client"
+// Volatile record types are the types that expire. Those record types have an
+// "expires_at" property.
+//
+// Concretely, those record types are all the oidc-provider record types except
+// the "Client" record type.
 const VOLATILE_TYPES = [
     'Session',
     'AccessToken',
@@ -21,9 +25,13 @@ const VOLATILE_TYPES = [
     'PushedAuthorizationRequest',
 ];
 
-// Purge after every purge_period upserts
-let purge_period = 1000;
-let upserts_count = 0;
+// So that when multiple fast writes (for example 10 fast writes) come in at the
+// same time, only one purge is triggered.
+let purge_single_execution_protection_delay = 2000; // in ms
+let purge_every_upserts_count = 1000;
+let upserts_since_purge_count = 0;
+let purge_scheduled = false;
+let purge_last_date = null;
 
 // Note: From the author of "oidc-provider" the MongoDB storage adapter is the
 // only one that can be considered a reference and that should be used as a
@@ -56,11 +64,12 @@ class StorageAdapter {
     async upsert(id, payload, expiresIn) {
         // Favoring reads over writes, since the OP is more often called for
         // verifying than for authenticating (the latter implying writes) and do
-        // thus performing purgeExpired only when some data is inserted or
+        // thus scheduling a purge only when some data is inserted or
         // updated and not when calling "find", "findByUid" or "findByUserCode".
-        if (++upserts_count >= purge_period) {
-            upserts_count = 0;
-            await this.purgeExpired();
+        if (++upserts_since_purge_count >= purge_every_upserts_count) {
+            // NOT doing an "await" here on purpose to not wait for the end of
+            // the scheduled purge.
+            this.constructor.schedulePurge();
         }
 
         const update_props = {
@@ -204,27 +213,10 @@ class StorageAdapter {
     }
 
     // *************************************************************************
-    // Methods non-required by the oidc-provider framework
+    // Useful methods but NOT required by the oidc-provider framework
     // *************************************************************************
 
-    /**
-     * Purges all the records of this oidc-provider model.
-     *
-     * Commodity method, but not required by the oidc-provider framework.
-     *
-     * @return {Promise} Promise fulfilled when the operation succeeded. Rejected with error
-     *   when encountered.
-     */
-    async purgeExpired() {
-        logger.debug('purging');
-        await knex(this.table_name)
-            .where('expires_at', '<=', new Date())
-            .del();
-    }
-
-    async destroyAll() {
-        await knex(this.table_name).del();
-    }
+    // Instance methods
 
     /**
      * Returns all, or a selection, of the records of this oidc-provider model.
@@ -244,19 +236,98 @@ class StorageAdapter {
             .orderBy(...options.order_by);
     }
 
-    // Static methods
-
-    static setPurgePeriod(count) {
-        purge_period = count;
+    /**
+     * Destroys/Drops/Removes all the records of this oidc-provider model
+     */
+    async destroyAll() {
+        await knex(this.table_name).del();
     }
 
-    static cleanVolatileData() {
-        return Promise.all(VOLATILE_TYPES.map((volatile_type_name) => {
+    // Class methods
+
+    static getVolatileRecordsStats() {
+        return Promise.all(VOLATILE_TYPES.map(async(volatile_type_name) => {
             const volatile_type = new StorageAdapter(volatile_type_name);
-            return volatile_type.destroyAll();
+            const res = await knex(volatile_type.table_name)
+                .count('id').min('created_at').max('created_at');
+
+            return {
+                type_name: volatile_type_name,
+                count: res[0].count,
+                date_min: res[0].min,
+                date_max: res[0].max,
+            };
         }));
     }
 
+    static async deleteVolatileRecords() {
+        await Promise.all(VOLATILE_TYPES.map(async(volatile_type_name) => {
+            const volatile_type = new StorageAdapter(volatile_type_name);
+            await volatile_type.destroyAll();
+        }));
+    }
+
+    static setPurgeProperties(props) {
+        if (props.purge_single_execution_protection_delay) {
+            purge_single_execution_protection_delay = props.purge_single_execution_protection_delay;
+        }
+        if (props.purge_every_upserts_count) {
+            purge_every_upserts_count = props.purge_every_upserts_count;
+        }
+    }
+
+    static async schedulePurge() {
+        if (purge_scheduled) {
+            logger.debug('A purge is already scheduled');
+            return;
+        }
+
+        purge_scheduled = true;
+        upserts_since_purge_count = 0;
+        logger.debug('Scheduling a new purge');
+        await this.purge();
+
+        await delay(purge_single_execution_protection_delay);
+        purge_scheduled = false;
+    }
+
+    /**
+     * Purges all the expired volatile records.
+     *
+     * Commodity method, but not required by the oidc-provider framework.
+     *
+     * @return {Promise} Promise fulfilled when the operation succeeded. Rejected with error
+     *   when encountered.
+     */
+    static async purge() {
+        const now = new Date();
+        purge_last_date = now;
+        await Promise.all(VOLATILE_TYPES.map(async(volatile_type_name) => {
+            const volatile_type = new StorageAdapter(volatile_type_name);
+            await knex(volatile_type.table_name)
+                .where('expires_at', '<=', now)
+                .del();
+        }));
+    }
+
+    static getPurgeInfo() {
+        return {
+            purge_single_execution_protection_delay,
+            purge_every_upserts_count,
+            upserts_since_purge_count,
+            purge_scheduled,
+            purge_last_date,
+        };
+    }
+
+}
+
+/**
+ * @param {number} duration in ms
+ * @returns {Promise} a promise
+ */
+async function delay(duration) {
+    await new Promise((resolve) => setTimeout(() => resolve(), duration));
 }
 
 module.exports = StorageAdapter;
